@@ -2,22 +2,30 @@
 import ast
 import configparser
 import importlib
+import logging
 import sys
+from abc import ABC, abstractmethod
 from pathlib import Path
 
 import pkg_resources
 
 
-# Version parsing
+logging.basicConfig(level=logging.DEBUG)
+log = logging.getLogger(__name__)
 
 
 def any_to_version(obj):
-    # https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L535
-    version = obj
-    if version is None:
-        return None
+    """
+    Convert any python object to a version string
 
-    if not isinstance(obj, str):
+    See https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L535
+
+    :param any obj: object to convert to version
+    :rtype: str
+    """
+    version = obj
+
+    if not isinstance(version, str):
         if hasattr(version, "__iter__"):
             version = ".".join(map(str, version))
         else:
@@ -26,137 +34,274 @@ def any_to_version(obj):
     return pkg_resources.safe_version(version)
 
 
-# SETUP.CFG
+def assert_subpath(subpath, path):
+    """
+    Check that `subpath` really is a subpath of `path`
 
+    Both `path` and `subpath` must be fully resolved before
+    doing the assertion, see pathlib.Path.resolve()
 
-def get_metadata_from_setup_cfg(dir_path="."):
-    setup_path = Path(dir_path)/"setup.cfg"
-    if not setup_path.is_file():
-        return None, None
-    parsed_setup = configparser.ConfigParser()
-    with setup_path.open() as f:
-        parsed_setup.read_file(f)
-    name = get_metadata_value(parsed_setup, "name")
-    version = get_metadata_value(parsed_setup, "version")
-    if version is not None:
-        version = resolve_pkg_version(version, dir_path)
-    return name, any_to_version(version)
-
-
-def get_metadata_value(parsed_setup, key):
+    :param (str | Path) subpath: Fully resolved path
+    :param (str | Path) path: Fully resolved path
+    :raises ValidationError: If not subpath
+    """
     try:
-        return parsed_setup.get("metadata", key)
-    except (configparser.NoSectionError, configparser.NoOptionError):
-        return None
+        Path(subpath).relative_to(Path(path))
+    except ValueError:
+        raise ValueError(f"{str(subpath)!r} is not a subpath of {str(path)!r}")
 
 
-def resolve_pkg_version(version_str, dir_path="."):
-    # https://setuptools.readthedocs.io/en/latest/setuptools.html#specifying-values
-    if version_str.startswith("attr:"):
-        attr_arg = version_str[len("attr:"):].strip()
-        version = resolve_version_attr(attr_arg, dir_path)
-    elif version_str.startswith("file:"):
-        file_arg = version_str[len("file:"):].strip()
-        version = resolve_version_file(file_arg, dir_path)
-    else:
-        # version attribute supports attr: and file: directives
-        # assume anything else should be interpreted as the version itself
-        version = version_str
-    return version
+def get_top_level_attr(module_ast, attr_name, before_line=None):
+    """
+    Get attribute from module if it is defined at top level and assigned to a Python literal
 
+    See https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L36
 
-def resolve_version_file(file_path, dir_path="."):
-    top_dir = Path(dir_path).resolve()
-    version_file = (top_dir/file_path).resolve()
-    if top_dir not in version_file.parents:
-        raise RuntimeError(f"Version file {file_path!r} is outside project directory")
-    if not version_file.is_file():
-        raise RuntimeError(f"Version file {file_path!r} does not exist or is not a file")
-    return version_file.read_text().strip()
+    Note that this approach is not equivalent to the setuptools one - setuptools looks for the
+    attribute starting from the top, we start at the bottom. Arguably, starting at the bottom
+    makes more sense, but it should not make any real difference in practice.
 
+    :param ast.Module module_ast: Root node of module as returned by ast.parse(<Python source>)
+    :param str attr_name: Name of attribute to search for
+    :param int before_line: Only look for attributes defined before this line
 
-def resolve_version_attr(attr_spec, dir_path="."):
-    module_import_path, _, attr_name = attr_spec.rpartition(".")
-    module_import_path = module_import_path or "__init__"
-    sys.path.insert(0, dir_path)
-    try:
-        spec = importlib.util.find_spec(module_import_path)
-    except Exception as e:
-        raise RuntimeError(e)
-    finally:
-        sys.path.pop(0)
-    if spec is None:
-        raise RuntimeError(f"Module {module_import_path!r} not found")
-    with open(spec.origin) as f:
-        module = ast.parse(f.read())
-    top_level_vars = get_top_level_literal_vars(module)
-    if attr_name not in top_level_vars:
-        msg = f"No top-level attribute {attr_name!r} in {module_import_path!r}"
-        raise RuntimeError(msg)
-    return top_level_vars[attr_name]
-
-
-def get_top_level_literal_vars(module_ast, before_line=None):
-    if not module_ast.body:
-        return {}
-    if before_line is None:
-        before_line = module_ast.body[-1].lineno + 1
-    literal_vars = {}
-    for node in module_ast.body:
-        if node.lineno < before_line and isinstance(node, ast.Assign):
-            try:
-                value = ast.literal_eval(node.value)
-            except ValueError:
-                continue
+    :rtype: anything that can be expressed as a literal ("primitive" types, collections)
+    """
+    for node in reversed(module_ast.body):
+        if (before_line is None or node.lineno < before_line) and isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name):
-                    literal_vars[target.id] = value
-    return literal_vars
+                if isinstance(target, ast.Name) and target.id == attr_name:
+                    try:
+                        return ast.literal_eval(node.value)
+                    except ValueError:
+                        return None
 
 
-# SETUP.PY
+class SetupFile(ABC):
+    """Abstract base class for setup.cfg and setup.py handling"""
+
+    def __init__(self, top_dir, file_name):
+        """
+        Initialize a SetupFile
+
+        :param str top_dir: Path to root of project directory
+        :param str file_name: Either "setup.cfg" or "setup.py"
+        """
+        self._top_dir = Path(top_dir).resolve()
+        self._path = self._top_dir / file_name
+
+    def exists(self):
+        """Check if file exists"""
+        return self._path.is_file()
+
+    @abstractmethod
+    def get_name(self):
+        """Attempt to determine the package name. Should only be called if file exists."""
+
+    @abstractmethod
+    def get_version(self):
+        """Attempt to determine the package version. Should only be called if file exists."""
 
 
-def get_metadata_from_setup_py(dir_path="."):
-    setup_path = Path(dir_path)/"setup.py"
-    if not setup_path.is_file():
-        return None, None
-    with setup_path.open() as f:
-        setup_ast = ast.parse(f.read())
-    setup_call = find_setup_call(setup_ast)
-    if setup_call is None:
-        raise RuntimeError(f"Setup script {str(setup_path)!r} has no setup() call")
-    top_level_vars = get_top_level_literal_vars(setup_ast, setup_call.lineno)
-    name = get_kwarg_value(setup_call, "name", top_level_vars)
-    version = get_kwarg_value(setup_call, "version", top_level_vars)
-    return name, any_to_version(version)
+class SetupCFG(SetupFile):
+    """
+    Parse metadata.name and metadata.version from a setup.cfg file
 
+    Aims to match setuptools behaviour as closely as possible, but does make
+    some compromises (such as never executing arbitrary Python code)
+    """
 
-def find_setup_call(module_ast):
-    for node in module_ast.body:
-        if isinstance(node, ast.Expr) and is_setup_call(node.value):
-            return node.value
-    return None
+    def __init__(self, top_dir):
+        """
+        Initialize a SetupCFG
 
+        :param str top_dir: Path to root of project directory
+        """
+        super().__init__(top_dir, "setup.cfg")
+        self._parsed = None
 
-def is_setup_call(node):
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    return (
-        isinstance(func, ast.Name) and func.id == "setup"
-        or isinstance(func, ast.Attribute) and func.attr == "setup"
-    )
+    def get_name(self):
+        """
+        Get metadata.name if present
 
+        :rtype: str or None
+        """
+        self._parse()
+        name = self._get_option("metadata", "name")
+        if name is None:
+            log.debug("No metadata.name in setup.cfg")
+        return name  # TODO: pkg_resources.safe_name?
 
-def get_kwarg_value(call_node, kwarg_name, top_level_vars=None):
-    for kw in call_node.keywords:
-        if kw.arg == kwarg_name:
+    def get_version(self):
+        """
+        Get metadata.version if present
+
+        Partially supports the file: directive (setuptools supports multiple files
+        as an argument to file:, this makes no sense for version)
+
+        Partially supports the attr: directive (will only work if the attribute
+        being referenced is assigned to a Python literal)
+
+        :rtype: str or None
+        """
+        self._parse()
+        version = self._get_option("metadata", "version")
+        if version is not None:
+            log.debug("Resolving metadata.version in setup.cfg from %r", version)
+            version = self._resolve_version(version)
+            if version is None:
+                log.debug("Failed to resolve metadata.version in setup.cfg")
+        else:
+            log.debug("No metadata.version in setup.cfg")
+
+        if version is not None:
+            return any_to_version(version)
+        else:
+            return None
+
+    def _parse(self):
+        """Parse config file if not already parsed"""
+        if self._parsed is None:
+            log.debug("Parsing setup.cfg at %s", self._path)
+            parsed = configparser.ConfigParser()
+            with self._path.open() as f:
+                parsed.read_file(f)
+            self._parsed = parsed
+        return self._parsed
+
+    def _get_option(self, section, option):
+        """Get option from config section, return None if missing"""
+        try:
+            return self._parsed.get(section, option)
+        except (configparser.NoSectionError, configparser.NoOptionError):
+            return None
+
+    def _resolve_version(self, version):
+        """
+        Attempt to resolve the version attribute
+
+        :param str version: version string, may contain file: or attr: directive
+        :rtype: str or None
+        """
+        if version.startswith("file:"):
+            file_arg = version[len("file:") :].strip()
+            version = self._read_version_from_file(file_arg)
+        elif version.startswith("attr:"):
+            attr_arg = version[len("attr:") :].strip()
+            version = self._read_version_from_attr(attr_arg)
+        return version
+
+    def _read_version_from_file(self, file_path):
+        """Read version from file after making sure file is a subpath of project dir"""
+        full_file_path = (self._top_dir / file_path).resolve()
+        assert_subpath(full_file_path, self._top_dir)
+
+        if full_file_path.is_file():
+            version = full_file_path.read_text().strip()
+            log.debug("Read version from %r: %r", file_path, version)
+            return version
+        else:
+            log.debug("Version file %r does not exist or is not a file", file_path)
+            return None
+
+    def _read_version_from_attr(self, attr_spec):
+        """
+        Read version from module attribute
+
+        Like setuptools, will try to find the attribute by looking for Python
+        literals in the AST of the module. Unlike setuptools, will not execute
+        the module if this fails.
+
+        See https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L354
+
+        :param str attr_spec: "import path" of attribute, e.g. package.version.__version__
+        :rtype: str or None
+        """
+        *attr_path, attr_name = attr_spec.split(".")
+        module_name = ".".join(attr_path)
+        module_name = module_name or "__init__"
+
+        log.debug("Attempting to find attribute %r in %r", attr_name, module_name)
+
+        parent_dir = self._top_dir
+        package_dirs = self._get_package_dirs()
+        # This part is lifted straight from setuptools (with minor modifications)
+        if package_dirs:
+            if attr_path and attr_path[0] in package_dirs:
+                custom_path = Path(package_dirs[attr_path[0]])
+                log.debug(
+                    "Custom path was specified for module %r: %r", attr_path[0], str(custom_path)
+                )
+                if len(custom_path.parts) > 1:
+                    parent_dir = (self._top_dir / custom_path.parent).resolve()
+                    module_name = custom_path.name
+                else:
+                    module_name = str(custom_path)
+            elif "" in package_dirs:
+                custom_path = Path(package_dirs[""])
+                log.debug("Custom path was specified for all root modules: %r", str(custom_path))
+                parent_dir = (self._top_dir / custom_path).resolve()
+
+        assert_subpath(parent_dir, self._top_dir)
+
+        sys.path.insert(0, str(parent_dir))
+        try:
+            spec = importlib.util.find_spec(module_name)
+        except Exception as e:
+            log.debug("Exception when looking for module %r: %r", module_name, e)
+            return None
+        finally:
+            sys.path.remove(str(parent_dir))
+
+        if spec is None:
+            log.debug("Could not find module %r", module_name)
+            return None
+
+        log.debug("Found source file for module %r at %r", module_name, spec.origin)
+        with open(spec.origin) as f:
             try:
-                return ast.literal_eval(kw.value)
-            except ValueError:
-                return (top_level_vars or {}).get(kw.value.id)
-    return None
+                module_ast = ast.parse(f.read(), f.name)
+            except SyntaxError as e:
+                log.debug("Syntax error when parsing module: %s", e)
+                return None
+
+        version = get_top_level_attr(module_ast, attr_name)
+        if version is not None:
+            log.debug("Found atribute %r in %r: %r", attr_name, module_name, version)
+        else:
+            log.debug("Could not find attribute %r in %r", attr_name, module_name)
+        return version
+
+    def _get_package_dirs(self):
+        """
+        Get options.package_dir and convert to dict if present
+
+        See _parse_list, _parse_dict in
+        https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py
+
+        :rtype: dict[str, str] or None
+        """
+        package_dir_value = self._get_option("options", "package_dir")
+        if package_dir_value is None:
+            return None
+
+        if "\n" in package_dir_value:
+            package_items = package_dir_value.splitlines()
+        else:
+            package_items = package_dir_value.split(",")
+
+        # Strip whitespace and discard empty values
+        package_items = filter(bool, (p.strip() for p in package_items))
+
+        package_dirs = {}
+        for item in package_items:
+            package, sep, p_dir = item.partition("=")
+            if not sep:
+                # '=' was missing
+                raise ValidationError("Failed to parse value in options.package_dir: %r", item)
+            package_dirs[package.strip()] = p_dir.strip()
+
+        return package_dirs
 
 
 if __name__ == "__main__":
@@ -165,10 +310,10 @@ if __name__ == "__main__":
     else:
         dir_path = "."
 
-    print("setup.cfg:")
-    name, version = get_metadata_from_setup_cfg(dir_path)
-    print(f"name = {name!r}, version = {version!r}")
+    setup_cfg = SetupCFG(dir_path)
+    if setup_cfg.exists():
+        name, version = setup_cfg.get_name(), setup_cfg.get_version()
+    else:
+        name, version = None, None
 
-    print("setup.py:")
-    name, version = get_metadata_from_setup_py(dir_path)
     print(f"name = {name!r}, version = {version!r}")
