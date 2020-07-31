@@ -16,9 +16,9 @@ log = logging.getLogger(__name__)
 
 def any_to_version(obj):
     """
-    Convert any python object to a version string
+    Convert any python object to a version string.
 
-    See https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L535
+    https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L535
 
     :param any obj: object to convert to version
     :rtype: str
@@ -36,10 +36,10 @@ def any_to_version(obj):
 
 def assert_subpath(subpath, path):
     """
-    Check that `subpath` really is a subpath of `path`
+    Check that `subpath` really is a subpath of `path`.
 
     Both `path` and `subpath` must be fully resolved before
-    doing the assertion, see pathlib.Path.resolve()
+    doing the assertion, see pathlib.Path.resolve().
 
     :param (str | Path) subpath: Fully resolved path
     :param (str | Path) path: Fully resolved path
@@ -53,9 +53,9 @@ def assert_subpath(subpath, path):
 
 def get_top_level_attr(module_ast, attr_name, before_line=None):
     """
-    Get attribute from module if it is defined at top level and assigned to a Python literal
+    Get attribute from module if it is defined at top level and assigned to a Python literal.
 
-    See https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L36
+    https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L36
 
     Note that this approach is not equivalent to the setuptools one - setuptools looks for the
     attribute starting from the top, we start at the bottom. Arguably, starting at the bottom
@@ -78,11 +78,11 @@ def get_top_level_attr(module_ast, attr_name, before_line=None):
 
 
 class SetupFile(ABC):
-    """Abstract base class for setup.cfg and setup.py handling"""
+    """Abstract base class for setup.cfg and setup.py handling."""
 
     def __init__(self, top_dir, file_name):
         """
-        Initialize a SetupFile
+        Initialize a SetupFile.
 
         :param str top_dir: Path to root of project directory
         :param str file_name: Either "setup.cfg" or "setup.py"
@@ -91,7 +91,7 @@ class SetupFile(ABC):
         self._path = self._top_dir / file_name
 
     def exists(self):
-        """Check if file exists"""
+        """Check if file exists."""
         return self._path.is_file()
 
     @abstractmethod
@@ -105,15 +105,15 @@ class SetupFile(ABC):
 
 class SetupCFG(SetupFile):
     """
-    Parse metadata.name and metadata.version from a setup.cfg file
+    Parse metadata.name and metadata.version from a setup.cfg file.
 
     Aims to match setuptools behaviour as closely as possible, but does make
-    some compromises (such as never executing arbitrary Python code)
+    some compromises (such as never executing arbitrary Python code).
     """
 
     def __init__(self, top_dir):
         """
-        Initialize a SetupCFG
+        Initialize a SetupCFG.
 
         :param str top_dir: Path to root of project directory
         """
@@ -122,7 +122,7 @@ class SetupCFG(SetupFile):
 
     def get_name(self):
         """
-        Get metadata.name if present
+        Get metadata.name if present.
 
         :rtype: str or None
         """
@@ -134,13 +134,13 @@ class SetupCFG(SetupFile):
 
     def get_version(self):
         """
-        Get metadata.version if present
+        Get metadata.version if present.
 
         Partially supports the file: directive (setuptools supports multiple files
-        as an argument to file:, this makes no sense for version)
+        as an argument to file:, this makes no sense for version).
 
         Partially supports the attr: directive (will only work if the attribute
-        being referenced is assigned to a Python literal)
+        being referenced is assigned to a Python literal).
 
         :rtype: str or None
         """
@@ -160,7 +160,7 @@ class SetupCFG(SetupFile):
             return None
 
     def _parse(self):
-        """Parse config file if not already parsed"""
+        """Parse config file if not already parsed."""
         if self._parsed is None:
             log.debug("Parsing setup.cfg at %s", self._path)
             parsed = configparser.ConfigParser()
@@ -170,7 +170,7 @@ class SetupCFG(SetupFile):
         return self._parsed
 
     def _get_option(self, section, option):
-        """Get option from config section, return None if missing"""
+        """Get option from config section, return None if missing."""
         try:
             return self._parsed.get(section, option)
         except (configparser.NoSectionError, configparser.NoOptionError):
@@ -178,7 +178,7 @@ class SetupCFG(SetupFile):
 
     def _resolve_version(self, version):
         """
-        Attempt to resolve the version attribute
+        Attempt to resolve the version attribute.
 
         :param str version: version string, may contain file: or attr: directive
         :rtype: str or None
@@ -192,7 +192,7 @@ class SetupCFG(SetupFile):
         return version
 
     def _read_version_from_file(self, file_path):
-        """Read version from file after making sure file is a subpath of project dir"""
+        """Read version from file after making sure file is a subpath of project dir."""
         full_file_path = (self._top_dir / file_path).resolve()
         assert_subpath(full_file_path, self._top_dir)
 
@@ -206,13 +206,13 @@ class SetupCFG(SetupFile):
 
     def _read_version_from_attr(self, attr_spec):
         """
-        Read version from module attribute
+        Read version from module attribute.
 
         Like setuptools, will try to find the attribute by looking for Python
         literals in the AST of the module. Unlike setuptools, will not execute
         the module if this fails.
 
-        See https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L354
+        https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L354
 
         :param str attr_spec: "import path" of attribute, e.g. package.version.__version__
         :rtype: str or None
@@ -225,6 +225,7 @@ class SetupCFG(SetupFile):
 
         parent_dir = self._top_dir
         package_dirs = self._get_package_dirs()
+
         # This part is lifted straight from setuptools (with minor modifications)
         if package_dirs:
             if attr_path and attr_path[0] in package_dirs:
@@ -274,10 +275,9 @@ class SetupCFG(SetupFile):
 
     def _get_package_dirs(self):
         """
-        Get options.package_dir and convert to dict if present
+        Get options.package_dir and convert to dict if present.
 
-        See _parse_list, _parse_dict in
-        https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py
+        https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L264
 
         :rtype: dict[str, str] or None
         """
