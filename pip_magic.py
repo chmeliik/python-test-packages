@@ -5,6 +5,8 @@ import importlib
 import sys
 from pathlib import Path
 
+import pkg_resources
+
 
 # SETUP.CFG
 
@@ -31,15 +33,18 @@ def get_metadata_value(parsed_setup, key):
 
 
 def resolve_pkg_version(version_str, dir_path="."):
+    # https://setuptools.readthedocs.io/en/latest/setuptools.html#specifying-values
     if version_str.startswith("attr:"):
         attr_arg = version_str[len("attr:"):].strip()
-        return resolve_version_attr(attr_arg, dir_path)
-    if version_str.startswith("file:"):
+        version = resolve_version_attr(attr_arg, dir_path)
+    elif version_str.startswith("file:"):
         file_arg = version_str[len("file:"):].strip()
-        return resolve_version_file(file_arg, dir_path)
-    # version attribute supports attr: and file: directives
-    # assume anything else should be interpreted as the version itself
-    return version_str
+        version = resolve_version_file(file_arg, dir_path)
+    else:
+        # version attribute supports attr: and file: directives
+        # assume anything else should be interpreted as the version itself
+        version = version_str
+    return pkg_resources.safe_version(version)
 
 
 def resolve_version_file(file_path, dir_path="."):
@@ -106,6 +111,8 @@ def get_metadata_from_setup_py(dir_path="."):
     top_level_vars = get_top_level_string_vars(setup_ast, setup_call.lineno)
     name = get_kwarg_string_value(setup_call, "name", top_level_vars)
     version = get_kwarg_string_value(setup_call, "version", top_level_vars)
+    if version is not None:
+        version = pkg_resources.safe_version(version)
     return name, version
 
 
