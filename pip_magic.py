@@ -8,6 +8,24 @@ from pathlib import Path
 import pkg_resources
 
 
+# Version parsing
+
+
+def any_to_version(obj):
+    # https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L535
+    version = obj
+    if version is None:
+        return None
+
+    if not isinstance(obj, str):
+        if hasattr(version, "__iter__"):
+            version = ".".join(map(str, version))
+        else:
+            version = str(version)
+
+    return pkg_resources.safe_version(version)
+
+
 # SETUP.CFG
 
 
@@ -22,7 +40,7 @@ def get_metadata_from_setup_cfg(dir_path="."):
     version = get_metadata_value(parsed_setup, "version")
     if version is not None:
         version = resolve_pkg_version(version, dir_path)
-    return name, version
+    return name, any_to_version(version)
 
 
 def get_metadata_value(parsed_setup, key):
@@ -44,7 +62,7 @@ def resolve_pkg_version(version_str, dir_path="."):
         # version attribute supports attr: and file: directives
         # assume anything else should be interpreted as the version itself
         version = version_str
-    return pkg_resources.safe_version(version)
+    return version
 
 
 def resolve_version_file(file_path, dir_path="."):
@@ -71,29 +89,29 @@ def resolve_version_attr(attr_spec, dir_path="."):
         raise RuntimeError(f"Module {module_import_path!r} not found")
     with open(spec.origin) as f:
         module = ast.parse(f.read())
-    top_level_vars = get_top_level_string_vars(module)
+    top_level_vars = get_top_level_literal_vars(module)
     if attr_name not in top_level_vars:
-        msg = f"No top-level string attribute {attr_name!r} in {module_import_path!r}"
+        msg = f"No top-level attribute {attr_name!r} in {module_import_path!r}"
         raise RuntimeError(msg)
     return top_level_vars[attr_name]
 
 
-def get_top_level_string_vars(module_ast, before_line=None):
+def get_top_level_literal_vars(module_ast, before_line=None):
     if not module_ast.body:
         return {}
     if before_line is None:
         before_line = module_ast.body[-1].lineno + 1
-    string_vars = {}
+    literal_vars = {}
     for node in module_ast.body:
-        if (
-            node.lineno < before_line
-            and isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Str)
-        ):
+        if node.lineno < before_line and isinstance(node, ast.Assign):
+            try:
+                value = ast.literal_eval(node.value)
+            except ValueError:
+                continue
             for target in node.targets:
                 if isinstance(target, ast.Name):
-                    string_vars[target.id] = node.value.s
-    return string_vars
+                    literal_vars[target.id] = value
+    return literal_vars
 
 
 # SETUP.PY
@@ -108,12 +126,10 @@ def get_metadata_from_setup_py(dir_path="."):
     setup_call = find_setup_call(setup_ast)
     if setup_call is None:
         raise RuntimeError(f"Setup script {str(setup_path)!r} has no setup() call")
-    top_level_vars = get_top_level_string_vars(setup_ast, setup_call.lineno)
-    name = get_kwarg_string_value(setup_call, "name", top_level_vars)
-    version = get_kwarg_string_value(setup_call, "version", top_level_vars)
-    if version is not None:
-        version = pkg_resources.safe_version(version)
-    return name, version
+    top_level_vars = get_top_level_literal_vars(setup_ast, setup_call.lineno)
+    name = get_kwarg_value(setup_call, "name", top_level_vars)
+    version = get_kwarg_value(setup_call, "version", top_level_vars)
+    return name, any_to_version(version)
 
 
 def find_setup_call(module_ast):
@@ -133,13 +149,13 @@ def is_setup_call(node):
     )
 
 
-def get_kwarg_string_value(call_node, kwarg_name, top_level_string_vars=None):
+def get_kwarg_value(call_node, kwarg_name, top_level_vars=None):
     for kw in call_node.keywords:
         if kw.arg == kwarg_name:
-            if isinstance(kw.value, ast.Str):
-                return kw.value.s
-            elif top_level_string_vars is not None and isinstance(kw.value, ast.Name):
-                return top_level_string_vars.get(kw.value.id)
+            try:
+                return ast.literal_eval(kw.value)
+            except ValueError:
+                return (top_level_vars or {}).get(kw.value.id)
     return None
 
 
