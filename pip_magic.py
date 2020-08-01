@@ -254,7 +254,7 @@ class SetupCFG(SetupFile):
         finally:
             sys.path.remove(str(parent_dir))
 
-        if spec is None:
+        if spec is None or spec.origin is None:
             log.debug("Could not find module %r", module_name)
             return None
 
@@ -296,10 +296,9 @@ class SetupCFG(SetupFile):
         package_dirs = {}
         for item in package_items:
             package, sep, p_dir = item.partition("=")
-            if not sep:
-                # '=' was missing
-                raise ValidationError("Failed to parse value in options.package_dir: %r", item)
-            package_dirs[package.strip()] = p_dir.strip()
+            if sep:
+                # Otherwise value was malformed (missing '=')
+                package_dirs[package.strip()] = p_dir.strip()
 
         return package_dirs
 
