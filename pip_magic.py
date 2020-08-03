@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 import ast
 import configparser
-import importlib
 import logging
-import sys
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -34,26 +33,9 @@ def any_to_version(obj):
     return pkg_resources.safe_version(version)
 
 
-def assert_subpath(subpath, path):
+def get_top_level_attr(block_node, attr_name, before_line=None):
     """
-    Check that `subpath` really is a subpath of `path`.
-
-    Both `path` and `subpath` must be fully resolved before
-    doing the assertion, see pathlib.Path.resolve().
-
-    :param (str | Path) subpath: Fully resolved path
-    :param (str | Path) path: Fully resolved path
-    :raises ValidationError: If not subpath
-    """
-    try:
-        Path(subpath).relative_to(Path(path))
-    except ValueError:
-        raise ValueError(f"{str(subpath)!r} is not a subpath of {str(path)!r}")
-
-
-def get_top_level_attr(module_ast, attr_name, before_line=None):
-    """
-    Get attribute from module if it is defined at top level and assigned to a Python literal.
+    Get attribute from module if it is defined at top level and assigned to a literal expression.
 
     https://github.com/pypa/setuptools/blob/ba209a15247b9578d565b7491f88dc1142ba29e4/setuptools/config.py#L36
 
@@ -61,20 +43,27 @@ def get_top_level_attr(module_ast, attr_name, before_line=None):
     attribute starting from the top, we start at the bottom. Arguably, starting at the bottom
     makes more sense, but it should not make any real difference in practice.
 
-    :param ast.Module module_ast: Root node of module as returned by ast.parse(<Python source>)
+    :param ast.AST block_node: Any AST node that has a 'body' attribute
     :param str attr_name: Name of attribute to search for
     :param int before_line: Only look for attributes defined before this line
 
     :rtype: anything that can be expressed as a literal ("primitive" types, collections)
+    :raises AttributeError: If attribute not found or not assigned to a literal expression
     """
-    for node in reversed(module_ast.body):
-        if (before_line is None or node.lineno < before_line) and isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == attr_name:
-                    try:
-                        return ast.literal_eval(node.value)
-                    except ValueError:
-                        return None
+    if before_line is None:
+        before_line = float("inf")
+    try:
+        return next(
+            ast.literal_eval(node.value)
+            for node in reversed(block_node.body)
+            if node.lineno < before_line and isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name) and target.id == attr_name
+        )
+    except ValueError:
+        raise AttributeError(f"Attribute {attr_name!r} is not assigned to a literal expression")
+    except StopIteration:
+        raise AttributeError(f"Attribute {attr_name!r} not found")
 
 
 class SetupFile(ABC):
@@ -111,6 +100,9 @@ class SetupCFG(SetupFile):
     some compromises (such as never executing arbitrary Python code).
     """
 
+    # Valid Python name - any sequence of \w characters that does not start with a number
+    _name_re = re.compile(r"[^\W\d]\w*")
+
     def __init__(self, top_dir):
         """
         Initialize a SetupCFG.
@@ -130,7 +122,10 @@ class SetupCFG(SetupFile):
         name = self._get_option("metadata", "name")
         if name is None:
             log.debug("No metadata.name in setup.cfg")
-        return name  # TODO: pkg_resources.safe_name?
+            return None
+
+        log.debug("Found metadata.name in setup.cfg: %r", name)
+        return name
 
     def get_version(self):
         """
@@ -140,24 +135,25 @@ class SetupCFG(SetupFile):
         as an argument to file:, this makes no sense for version).
 
         Partially supports the attr: directive (will only work if the attribute
-        being referenced is assigned to a Python literal).
+        being referenced is assigned to a literal expression).
 
         :rtype: str or None
         """
         self._parse()
         version = self._get_option("metadata", "version")
-        if version is not None:
-            log.debug("Resolving metadata.version in setup.cfg from %r", version)
-            version = self._resolve_version(version)
-            if version is None:
-                log.debug("Failed to resolve metadata.version in setup.cfg")
-        else:
+        if version is None:
             log.debug("No metadata.version in setup.cfg")
-
-        if version is not None:
-            return any_to_version(version)
-        else:
             return None
+
+        log.debug("Resolving metadata.version in setup.cfg from %r", version)
+        version = self._resolve_version(version)
+        if version is None:
+            log.debug("Failed to resolve metadata.version in setup.cfg")
+            return None
+
+        version = any_to_version(version)
+        log.debug("Found metadata.version in setup.cfg: %r", version)
+        return version
 
     def _parse(self):
         """Parse config file if not already parsed."""
@@ -177,12 +173,7 @@ class SetupCFG(SetupFile):
             return None
 
     def _resolve_version(self, version):
-        """
-        Attempt to resolve the version attribute.
-
-        :param str version: version string, may contain file: or attr: directive
-        :rtype: str or None
-        """
+        """Attempt to resolve the version attribute."""
         if version.startswith("file:"):
             file_arg = version[len("file:") :].strip()
             version = self._read_version_from_file(file_arg)
@@ -193,9 +184,7 @@ class SetupCFG(SetupFile):
 
     def _read_version_from_file(self, file_path):
         """Read version from file after making sure file is a subpath of project dir."""
-        full_file_path = (self._top_dir / file_path).resolve()
-        assert_subpath(full_file_path, self._top_dir)
-
+        full_file_path = self._ensure_local(file_path)
         if full_file_path.is_file():
             version = full_file_path.read_text().strip()
             log.debug("Read version from %r: %r", file_path, version)
@@ -203,6 +192,15 @@ class SetupCFG(SetupFile):
         else:
             log.debug("Version file %r does not exist or is not a file", file_path)
             return None
+
+    def _ensure_local(self, path):
+        """Check that path is a subpath of project directory, return resolved path."""
+        full_path = (self._top_dir / path).resolve()
+        try:
+            full_path.relative_to(self._top_dir)
+        except ValueError:
+            raise ValueError(f"{str(path)!r} is not a subpath of {str(self._top_dir)!r}")
+        return full_path
 
     def _read_version_from_attr(self, attr_spec):
         """
@@ -217,61 +215,80 @@ class SetupCFG(SetupFile):
         :param str attr_spec: "import path" of attribute, e.g. package.version.__version__
         :rtype: str or None
         """
-        *attr_path, attr_name = attr_spec.split(".")
-        module_name = ".".join(attr_path)
-        module_name = module_name or "__init__"
+        module_name, _, attr_name = attr_spec.rpartition(".")
+        if not module_name:
+            # Assume current directory is a module, look for attribute in __init__.py
+            module_name = "__init__"
 
         log.debug("Attempting to find attribute %r in %r", attr_name, module_name)
 
-        parent_dir = self._top_dir
-        package_dirs = self._get_package_dirs()
-
-        # This part is lifted straight from setuptools (with minor modifications)
-        if package_dirs:
-            if attr_path and attr_path[0] in package_dirs:
-                custom_path = Path(package_dirs[attr_path[0]])
-                log.debug(
-                    "Custom path was specified for module %r: %r", attr_path[0], str(custom_path)
-                )
-                if len(custom_path.parts) > 1:
-                    parent_dir = (self._top_dir / custom_path.parent).resolve()
-                    module_name = custom_path.name
-                else:
-                    module_name = str(custom_path)
-            elif "" in package_dirs:
-                custom_path = Path(package_dirs[""])
-                log.debug("Custom path was specified for all root modules: %r", str(custom_path))
-                parent_dir = (self._top_dir / custom_path).resolve()
-
-        assert_subpath(parent_dir, self._top_dir)
-
-        sys.path.insert(0, str(parent_dir))
-        try:
-            spec = importlib.util.find_spec(module_name)
-        except Exception as e:
-            log.debug("Exception when looking for module %r: %r", module_name, e)
-            return None
-        finally:
-            sys.path.remove(str(parent_dir))
-
-        if spec is None or spec.origin is None:
-            log.debug("Could not find module %r", module_name)
-            return None
-
-        log.debug("Found source file for module %r at %r", module_name, spec.origin)
-        with open(spec.origin) as f:
-            try:
-                module_ast = ast.parse(f.read(), f.name)
-            except SyntaxError as e:
-                log.debug("Syntax error when parsing module: %s", e)
-                return None
-
-        version = get_top_level_attr(module_ast, attr_name)
-        if version is not None:
-            log.debug("Found atribute %r in %r: %r", attr_name, module_name, version)
+        module_file = self._find_module(module_name, self._get_package_dirs())
+        if module_file is not None:
+            log.debug("Found module %r at %r", module_name, str(module_file))
         else:
-            log.debug("Could not find attribute %r in %r", attr_name, module_name)
-        return version
+            log.debug("Module %r not found", module_name)
+            return None
+
+        try:
+            module_ast = ast.parse(module_file.read_text(), module_file.name)
+        except SyntaxError as e:
+            log.debug("Syntax error when parsing module: %s", e)
+            return None
+
+        try:
+            version = get_top_level_attr(module_ast, attr_name)
+            log.debug("Found atribute %r in %r: %r", attr_name, module_name, version)
+            return version
+        except AttributeError as e:
+            log.debug("Could not find attribute in %r: %s", module_name, e)
+            return None
+
+    def _find_module(self, module_name, package_dir=None):
+        """
+        Try to find a module in the project directory and return path to source file.
+
+        :param str module_name: "import path" of module
+        :param dict[str, str] package_dir: same semantics as options.package_dir in setup.cfg
+
+        :rtype: Path or None
+        """
+        module_path = self._convert_to_path(module_name)
+        root_module = module_path.parts[0]
+
+        package_dir = package_dir or {}
+
+        if root_module in package_dir:
+            custom_path = Path(package_dir[root_module])
+            log.debug(f"Custom path set for root module %r: %r", root_module, str(custom_path))
+            # Custom path replaces the root module
+            module_path = custom_path.joinpath(*module_path.parts[1:])
+        elif "" in package_dir:
+            custom_path = Path(package_dir[""])
+            log.debug(f"Custom path set for all root modules: %r", str(custom_path))
+            # Custom path does not replace the root module
+            module_path = custom_path / module_path
+
+        full_module_path = self._ensure_local(module_path)
+
+        package_init = full_module_path / "__init__.py"
+        if package_init.is_file():
+            return package_init
+
+        module_py = Path(f"{full_module_path}.py")
+        if module_py.is_file():
+            return module_py
+
+        return None
+
+    def _convert_to_path(self, module_name):
+        """Check that module name is valid and covert to file path."""
+        parts = module_name.split(".")
+        if not parts[0]:
+            # Relative import (supported only to the extent that one leading '.' is ignored)
+            parts.pop(0)
+        if not all(self._name_re.fullmatch(part) for part in parts):
+            raise ValueError(f"{module_name!r} is not an accepted module name")
+        return Path(*parts)
 
     def _get_package_dirs(self):
         """
@@ -297,13 +314,15 @@ class SetupCFG(SetupFile):
         for item in package_items:
             package, sep, p_dir = item.partition("=")
             if sep:
-                # Otherwise value was malformed (missing '=')
+                # Otherwise value was malformed ('=' was missing)
                 package_dirs[package.strip()] = p_dir.strip()
 
         return package_dirs
 
 
 if __name__ == "__main__":
+    import sys
+
     if len(sys.argv) > 1:
         dir_path = sys.argv[1]
     else:
